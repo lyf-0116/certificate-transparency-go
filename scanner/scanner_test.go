@@ -17,17 +17,24 @@ package scanner
 import (
 	"container/list"
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"sync/atomic"
 	"testing"
 
 	ct "github.com/google/certificate-transparency-go"
 	"github.com/google/certificate-transparency-go/client"
 	"github.com/google/certificate-transparency-go/jsonclient"
+	"github.com/google/certificate-transparency-go/tls"
 	"github.com/google/certificate-transparency-go/x509"
 )
+
+type matchAllLeaves struct{}
+
+func (matchAllLeaves) Matches(*ct.LeafEntry) bool { return true }
 
 func TestScannerMatchAll(t *testing.T) {
 	var cert x509.Certificate
@@ -256,5 +263,41 @@ func TestDefaultScannerOptions(t *testing.T) {
 	}
 	if opts.StartIndex != 0 {
 		t.Fatalf("Expected StartIndex to be 0, but was %d", opts.StartIndex)
+	}
+}
+
+func TestScannerCountsUnknownEntries(t *testing.T) {
+	leaf := ct.MerkleTreeLeaf{
+		Version:  ct.V1,
+		LeafType: ct.TimestampedEntryLeafType,
+		TimestampedEntry: &ct.TimestampedEntry{
+			Timestamp: 1234,
+			EntryType: ct.LogEntryType(32768),
+			JSONEntry: &ct.JSONDataEntry{Data: []byte("unknown entry payload")},
+		},
+	}
+	leafInput, err := tls.Marshal(leaf)
+	if err != nil {
+		t.Fatalf("failed to marshal unknown leaf: %v", err)
+	}
+
+	for _, matcher := range []interface{}{MatchAll{}, matchAllLeaves{}} {
+		t.Run(fmt.Sprintf("%T", matcher), func(t *testing.T) {
+			s := &Scanner{opts: ScannerOptions{Matcher: matcher}}
+			entries := make(chan entryInfo, 1)
+			entries <- entryInfo{index: 1, entry: ct.LeafEntry{LeafInput: leafInput}}
+			close(entries)
+
+			s.matcherJob(entries,
+				func(*ct.RawLogEntry) { t.Error("unknown entry reported as a certificate") },
+				func(*ct.RawLogEntry) { t.Error("unknown entry reported as a precertificate") })
+
+			if got := atomic.LoadInt64(&s.unknownEntries); got != 1 {
+				t.Errorf("unknownEntries = %d; want 1", got)
+			}
+			if got := atomic.LoadInt64(&s.unparsableEntries); got != 0 {
+				t.Errorf("unparsableEntries = %d; want 0", got)
+			}
+		})
 	}
 }

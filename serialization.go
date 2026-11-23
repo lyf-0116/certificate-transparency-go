@@ -17,6 +17,7 @@ package ct
 import (
 	"crypto"
 	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"time"
 
@@ -220,8 +221,19 @@ func IsPreIssuer(issuer *x509.Certificate) bool {
 
 // RawLogEntryFromLeaf converts a LeafEntry object (which has the raw leaf data
 // after JSON parsing) into a RawLogEntry object (i.e. a TLS-parsed structure).
+// Unknown entry types are represented by their original leaf input in
+// Leaf.TimestampedEntry.JSONEntry.
 func RawLogEntryFromLeaf(index int64, entry *LeafEntry) (*RawLogEntry, error) {
 	ret := RawLogEntry{Index: index}
+
+	// An unknown entry type cannot be unmarshalled into a TimestampedEntry
+	// because there is no field selected for it. Preserve the original leaf
+	// instead of rejecting the whole get-entries batch.
+	if leaf, ok := unknownMerkleTreeLeaf(entry.LeafInput); ok {
+		ret.Leaf = *leaf
+		return &ret, nil
+	}
+
 	if rest, err := tls.Unmarshal(entry.LeafInput, &ret.Leaf); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal MerkleTreeLeaf: %v", err)
 	} else if len(rest) > 0 {
@@ -249,13 +261,38 @@ func RawLogEntryFromLeaf(index int64, entry *LeafEntry) (*RawLogEntry, error) {
 		ret.Cert = precertChain.PreCertificate
 		ret.Chain = precertChain.CertificateChain
 
-	default:
-		// TODO(pavelkalinnikov): Section 4.6 of RFC6962 implies that unknown types
-		// are not errors. We should revisit how we process this case.
-		return nil, fmt.Errorf("unknown entry type: %v", eType)
 	}
 
 	return &ret, nil
+}
+
+// unknownMerkleTreeLeaf extracts the header of a MerkleTreeLeaf whose entry
+// type has no corresponding TimestampedEntry field. The type-specific entry
+// data and extensions remain opaque.
+func unknownMerkleTreeLeaf(data []byte) (*MerkleTreeLeaf, bool) {
+	// Version (1) + LeafType (1) + Timestamp (8) + EntryType (2).
+	const headerLen = 12
+	if len(data) < headerLen ||
+		Version(data[0]) != V1 ||
+		MerkleLeafType(data[1]) != TimestampedEntryLeafType {
+		return nil, false
+	}
+
+	entryType := LogEntryType(binary.BigEndian.Uint16(data[10:headerLen]))
+	switch entryType {
+	case X509LogEntryType, PrecertLogEntryType, jsonLogEntryType:
+		return nil, false
+	}
+
+	return &MerkleTreeLeaf{
+		Version:  V1,
+		LeafType: TimestampedEntryLeafType,
+		TimestampedEntry: &TimestampedEntry{
+			Timestamp: binary.BigEndian.Uint64(data[2:10]),
+			EntryType: entryType,
+			JSONEntry: &JSONDataEntry{Data: data},
+		},
+	}, true
 }
 
 // ToLogEntry converts RawLogEntry to a LogEntry, which includes an x509-parsed
@@ -263,6 +300,7 @@ func RawLogEntryFromLeaf(index int64, entry *LeafEntry) (*RawLogEntry, error) {
 //
 // Note that this function may return a valid LogEntry object and a non-nil
 // error value, when the error indicates a non-fatal parsing error.
+// Unknown entry types are returned in JSONData.
 func (rle *RawLogEntry) ToLogEntry() (*LogEntry, error) {
 	var err error
 	entry := LogEntry{Index: rle.Index, Leaf: rle.Leaf, Chain: rle.Chain}
@@ -287,7 +325,10 @@ func (rle *RawLogEntry) ToLogEntry() (*LogEntry, error) {
 		}
 
 	default:
-		return nil, fmt.Errorf("unknown entry type: %v", eType)
+		if rle.Leaf.TimestampedEntry.JSONEntry == nil {
+			return nil, fmt.Errorf("unknown entry type: %v", eType)
+		}
+		entry.JSONData = rle.Leaf.TimestampedEntry.JSONEntry.Data
 	}
 
 	// err may be non-nil for a non-fatal error.

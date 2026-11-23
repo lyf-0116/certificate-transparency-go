@@ -39,6 +39,7 @@ type LogEntryType tls.Enum // tls:"maxval:65535"
 const (
 	X509LogEntryType    LogEntryType = 0
 	PrecertLogEntryType LogEntryType = 1
+	jsonLogEntryType    LogEntryType = 32768
 )
 
 func (e LogEntryType) String() string {
@@ -228,7 +229,7 @@ type LogEntry struct {
 	// Exactly one of the following three fields should be non-empty.
 	X509Cert *x509.Certificate // Parsed X.509 certificate
 	Precert  *Precertificate   // Extracted precertificate
-	JSONData []byte
+	JSONData []byte            // Payload for other entry types
 
 	// Chain holds the issuing certificate chain, starting with the
 	// issuer of the leaf certificate / pre-certificate.

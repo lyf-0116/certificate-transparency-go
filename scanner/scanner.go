@@ -68,6 +68,9 @@ type Scanner struct {
 	// Counter of the number of precertificates encountered during the scan.
 	precertsSeen int64
 
+	// Counter of entries that are neither certificates nor precertificates.
+	unknownEntries int64
+
 	unparsableEntries         int64
 	entriesWithNonFatalErrors int64
 
@@ -146,6 +149,8 @@ func (s *Scanner) processMatcherEntry(matcher Matcher, info entryInfo, foundCert
 			foundPrecert(rawLogEntry)
 		}
 		atomic.AddInt64(&s.precertsSeen, 1)
+	case logEntry.JSONData != nil:
+		atomic.AddInt64(&s.unknownEntries, 1)
 	default:
 		return fmt.Errorf("saw unknown entry type: %v", logEntry.Leaf.TimestampedEntry.EntryType)
 	}
@@ -172,7 +177,11 @@ func (s *Scanner) processMatcherLeafEntry(matcher LeafMatcher, info entryInfo, f
 		foundPrecert(rawLogEntry)
 		atomic.AddInt64(&s.precertsSeen, 1)
 	default:
-		return fmt.Errorf("saw unknown entry type: %v", eType)
+		logEntry, err := rawLogEntry.ToLogEntry()
+		if err != nil || logEntry.JSONData == nil {
+			return fmt.Errorf("saw unknown entry type: %v", eType)
+		}
+		atomic.AddInt64(&s.unknownEntries, 1)
 	}
 	return nil
 }
@@ -262,6 +271,7 @@ func (s *Scanner) ScanLog(ctx context.Context, foundCert func(*ct.RawLogEntry), 
 	s.certsProcessed = 0
 	s.certsMatched = 0
 	s.precertsSeen = 0
+	s.unknownEntries = 0
 	s.unparsableEntries = 0
 	s.entriesWithNonFatalErrors = 0
 
@@ -305,6 +315,7 @@ func (s *Scanner) ScanLog(ctx context.Context, foundCert func(*ct.RawLogEntry), 
 
 	klog.V(1).Infof("Completed %d certs in %s", atomic.LoadInt64(&s.certsProcessed), humanTime(time.Since(startTime)))
 	klog.V(1).Infof("Saw %d precerts", atomic.LoadInt64(&s.precertsSeen))
+	klog.V(1).Infof("Saw %d unknown entries", atomic.LoadInt64(&s.unknownEntries))
 	klog.V(1).Infof("Saw %d unparsable entries", atomic.LoadInt64(&s.unparsableEntries))
 	klog.V(1).Infof("Saw %d non-fatal errors", atomic.LoadInt64(&s.entriesWithNonFatalErrors))
 

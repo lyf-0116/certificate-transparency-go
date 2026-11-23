@@ -183,6 +183,52 @@ func TestGetEntries(t *testing.T) {
 	}
 }
 
+func TestGetEntriesWithUnknownType(t *testing.T) {
+	const payload = "unknown entry payload"
+	leaf := ct.MerkleTreeLeaf{
+		Version:  ct.V1,
+		LeafType: ct.TimestampedEntryLeafType,
+		TimestampedEntry: &ct.TimestampedEntry{
+			Timestamp: 1234,
+			EntryType: ct.LogEntryType(32768),
+			JSONEntry: &ct.JSONDataEntry{Data: []byte(payload)},
+		},
+	}
+	leafInput, err := tls.Marshal(leaf)
+	if err != nil {
+		t.Fatalf("failed to marshal unknown leaf: %v", err)
+	}
+
+	ts := serveHandlerAt(t, "/ct/v1/get-entries", func(w http.ResponseWriter, r *http.Request) {
+		_, err := fmt.Fprintf(w, `{"entries":[{"leaf_input":"%s","extra_data":""},{"leaf_input":"%s","extra_data":"%s"}]}`,
+			base64.StdEncoding.EncodeToString(leafInput),
+			CertEntryB64,
+			CertEntryExtraDataB64)
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+	defer ts.Close()
+	lc, err := client.New(ts.URL, &http.Client{}, jsonclient.Options{})
+	if err != nil {
+		t.Fatalf("Failed to create client: %v", err)
+	}
+
+	entries, err := lc.GetEntries(context.Background(), 0, 1)
+	if err != nil {
+		t.Fatalf("GetEntries(0,1) = nil, %v; want 2 entries, nil", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("GetEntries(0,1) returned %d entries; want 2", len(entries))
+	}
+	if got := string(entries[0].JSONData); got != payload {
+		t.Errorf("GetEntries(0,1)[0].JSONData = %q; want %q", got, payload)
+	}
+	if entries[1].X509Cert == nil {
+		t.Error("GetEntries(0,1)[1].X509Cert = nil; want certificate")
+	}
+}
+
 func TestGetEntriesErrors(t *testing.T) {
 	ctx := context.Background()
 	var tests = []struct {

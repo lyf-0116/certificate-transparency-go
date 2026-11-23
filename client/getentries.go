@@ -50,6 +50,7 @@ func (c *LogClient) GetRawEntries(ctx context.Context, start, end int64) (*ct.Ge
 // However, this does mean that any certificate parsing failures will cause a failure of the whole
 // retrieval operation; for more robust retrieval of parsed certificates, use GetRawEntries() and invoke
 // ct.LogEntryFromLeaf() on each individual entry.
+// Entries with unknown types are returned with their payload in JSONData.
 func (c *LogClient) GetEntries(ctx context.Context, start, end int64) ([]ct.LogEntry, error) {
 	resp, err := c.GetRawEntries(ctx, start, end)
 	if err != nil {

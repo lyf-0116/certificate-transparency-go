@@ -369,11 +369,13 @@ func TestLogEntryFromLeaf(t *testing.T) {
 
 	corruptedLeafDER := "aaaaaaaaaa" + leafDER[10:]
 	corruptedPrecertTBS := precertTBS[:6] + "aaaaaaaaaa" + precertTBS[16:]
+	unknownLeafInput := dh("00" + "00" + "0000015dcc2b99c8" + "0002" + "deadbeef" + noExts)
 
 	var tests = []struct {
 		leaf        LeafEntry
 		wantCert    bool
 		wantPrecert bool
+		wantJSON    []byte
 		wantErr     string
 	}{
 		{
@@ -419,7 +421,13 @@ func TestLogEntryFromLeaf(t *testing.T) {
 			leaf: LeafEntry{
 				LeafInput: dh("00" + "00" + "0000015dcc2b99c8" + "8000" + "0004f3" + leafDER + noExts),
 			},
-			wantErr: "unknown entry type",
+			wantJSON: dh(leafDER),
+		},
+		{
+			leaf: LeafEntry{
+				LeafInput: unknownLeafInput,
+			},
+			wantJSON: unknownLeafInput,
 		},
 		{
 			leaf: LeafEntry{
@@ -477,6 +485,12 @@ func TestLogEntryFromLeaf(t *testing.T) {
 		}
 		if gotPrecert := got != nil && got.Precert != nil; gotPrecert != test.wantPrecert {
 			t.Errorf("LogEntryFromLeaf(%d).Precert = %v; want %v", i, gotPrecert, test.wantPrecert)
+		}
+		if gotJSON := got != nil && got.JSONData != nil; gotJSON != (test.wantJSON != nil) {
+			t.Errorf("LogEntryFromLeaf(%d).JSONData = %v; want %v", i, gotJSON, test.wantJSON != nil)
+		}
+		if got != nil && test.wantJSON != nil && !bytes.Equal(got.JSONData, test.wantJSON) {
+			t.Errorf("LogEntryFromLeaf(%d).JSONData = %x; want %x", i, got.JSONData, test.wantJSON)
 		}
 	}
 }
