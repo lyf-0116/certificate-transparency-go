@@ -16,6 +16,7 @@ package scanner
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"sync"
 	"time"
@@ -71,6 +72,13 @@ type Fetcher struct {
 	// Configuration options for this Fetcher instance.
 	opts *FetcherOptions
 
+	// maxFetchAttempts bounds how many times fetching a single batch may
+	// fail (or return no entries) before the worker gives up and reports an
+	// error. fetchBackoffMin/Max bound the pause between such attempts.
+	maxFetchAttempts int
+	fetchBackoffMin  time.Duration
+	fetchBackoffMax  time.Duration
+
 	// Current STH of the Log this Fetcher sends queries to.
 	sth *ct.SignedTreeHead
 	// The STH retrieval backoff state. Used only in Continuous fetch mode.
@@ -79,6 +87,8 @@ type Fetcher struct {
 	// Stops range generator, which causes the Fetcher to terminate gracefully.
 	mu     sync.Mutex
 	cancel context.CancelFunc
+	// The first error encountered by a fetcher worker, if any.
+	err error
 }
 
 // EntryBatch represents a contiguous range of entries of the Log.
@@ -98,10 +108,13 @@ type fetchRange struct {
 func NewFetcher(client LogClient, opts *FetcherOptions) *Fetcher {
 	cancel := func() {} // Protect against calling Stop before Run.
 	return &Fetcher{
-		uri:    client.BaseURI(),
-		client: client,
-		opts:   opts,
-		cancel: cancel,
+		uri:              client.BaseURI(),
+		client:           client,
+		opts:             opts,
+		cancel:           cancel,
+		maxFetchAttempts: 10,
+		fetchBackoffMin:  1 * time.Second,
+		fetchBackoffMax:  30 * time.Second,
 	}
 }
 
@@ -141,6 +154,7 @@ func (f *Fetcher) Run(ctx context.Context, fn func(EntryBatch)) error {
 
 	f.mu.Lock()
 	f.cancel = cancel
+	f.err = nil
 	f.mu.Unlock()
 
 	// Use a separately-cancelable context for the range generator, so we can
@@ -155,14 +169,21 @@ func (f *Fetcher) Run(ctx context.Context, fn func(EntryBatch)) error {
 		go func(idx int) {
 			defer wg.Done()
 			klog.V(1).Infof("%s: Fetcher worker %d starting...", f.uri, idx)
-			f.runWorker(ctx, ranges, fn)
+			if err := f.runWorker(ctx, ranges, fn); err != nil {
+				klog.Errorf("%s: Fetcher worker %d failed: %v", f.uri, idx, err)
+				f.setErr(err)
+				f.Stop() // Stop the range generator, so the other workers exit.
+			}
 			klog.V(1).Infof("%s: Fetcher worker %d finished", f.uri, idx)
 		}(w)
 	}
 	wg.Wait()
 
 	klog.V(1).Infof("%s: Fetcher terminated", f.uri)
-	return nil
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.err
 }
 
 // Stop causes the Fetcher to terminate gracefully. After this call Run will
@@ -172,6 +193,15 @@ func (f *Fetcher) Stop() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.cancel()
+}
+
+// setErr records the given error if no error has been recorded yet.
+func (f *Fetcher) setErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err == nil {
+		f.err = err
+	}
 }
 
 // genRanges returns a channel of ranges to fetch, and starts a goroutine that
@@ -258,46 +288,65 @@ func (f *Fetcher) updateSTH(ctx context.Context) error {
 
 // runWorker is a worker function for handling fetcher ranges.
 // Accepts cert ranges to fetch over the ranges channel, and if the fetch is
-// successful sends the corresponding EntryBatch through the fn callback. Will
-// retry failed attempts to retrieve ranges until the context is cancelled.
-func (f *Fetcher) runWorker(ctx context.Context, ranges <-chan fetchRange, fn func(EntryBatch)) {
+// successful sends the corresponding EntryBatch through the fn callback.
+//
+// Every iteration must advance the cursor by at least one entry: failed
+// requests and empty responses are retried with backoff, and if the cursor
+// still cannot advance after maxFetchAttempts attempts, the worker gives up
+// and returns an error.
+func (f *Fetcher) runWorker(ctx context.Context, ranges <-chan fetchRange, fn func(EntryBatch)) error {
 	for r := range ranges {
 		// Logs MAY return fewer than the number of leaves requested. Only complete
 		// if we actually got all the leaves we were expecting.
 		for r.start <= r.end {
 			if ctx.Err() != nil { // Prevent spinning when context is canceled.
-				return
+				return nil
 			}
 			// TODO(pavelkalinnikov): Make these parameters tunable.
 			// This backoff will only apply to a single request and be reset for the next one.
 			// This precludes reaching some kind of stability in request rate, but means that
 			// an intermittent problem won't harm long-term running of the worker.
 			bo := &backoff.Backoff{
-				Min:    1 * time.Second,
-				Max:    30 * time.Second,
+				Min:    f.fetchBackoffMin,
+				Max:    f.fetchBackoffMax,
 				Factor: 2,
 				Jitter: true,
 			}
 
 			var resp *ct.GetEntriesResponse
+			var err error
 			// TODO(pavelkalinnikov): Report errors in a LogClient decorator on failure.
-			if err := bo.Retry(ctx, func() error {
-				var err error
+			for attempt := 1; ; attempt++ {
 				resp, err = f.client.GetRawEntries(ctx, r.start, r.end)
-				return err
-			}); err != nil {
+				if err == nil {
+					if resp == nil || len(resp.Entries) == 0 {
+						// The log returned no entries for a non-empty range, so
+						// the cursor cannot advance. Retry with backoff instead
+						// of spinning in place.
+						err = fmt.Errorf("no entries returned for range [%d, %d]", r.start, r.end)
+					} else {
+						break
+					}
+				}
+				if attempt >= f.maxFetchAttempts {
+					return fmt.Errorf("giving up after %d attempts: %v", attempt, err)
+				}
 				if rspErr, isRspErr := err.(jsonclient.RspError); isRspErr && rspErr.StatusCode == http.StatusTooManyRequests {
 					klog.V(2).Infof("%s: GetRawEntries() failed: %v", f.uri, err)
 				} else {
 					klog.Errorf("%s: GetRawEntries() failed: %v", f.uri, err)
 				}
-				// There is no error reporting yet for this worker, so just retry again.
-				continue
+				select {
+				case <-ctx.Done():
+					return nil
+				case <-time.After(bo.Duration()):
+				}
 			}
 			fn(EntryBatch{Start: r.start, Entries: resp.Entries})
 			r.start += int64(len(resp.Entries))
 		}
 	}
+	return nil
 }
 
 func min(a, b int64) int64 {

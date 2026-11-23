@@ -308,7 +308,7 @@ func (s *Scanner) ScanLog(ctx context.Context, foundCert func(*ct.RawLogEntry), 
 	klog.V(1).Infof("Saw %d unparsable entries", atomic.LoadInt64(&s.unparsableEntries))
 	klog.V(1).Infof("Saw %d non-fatal errors", atomic.LoadInt64(&s.entriesWithNonFatalErrors))
 
-	return int64(s.fetcher.opts.EndIndex), nil
+	return atomic.LoadInt64(&s.certsProcessed), nil
 }
 
 // NewScanner creates a Scanner instance using client to talk to the log,
